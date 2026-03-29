@@ -62,39 +62,22 @@ export async function getAgentDashboardData() {
   const { user } = await verifySession(['agent'])
   const supabase = await createClient()
 
-  // Fetch staff available
-  const { data: staffList } = await supabase
-    .from('users')
-    .select('id, full_name')
-    .eq('role', 'staff')
-    .order('full_name')
-
-  // Fetch distributions for today
   const today = new Date()
   today.setHours(0,0,0,0)
-
-  const { data: distributions } = await supabase
-    .from('distributions')
-    .select(`
-      id,
-      created_at,
-      quantity,
-      status,
-      staff:users!distributions_staff_id_fkey (full_name)
-    `)
-    .gte('created_at', today.toISOString())
-    .order('created_at', { ascending: false })
-    .limit(10)
-
-  // Fetch distributions for the last 7 days (Weekly)
+  
   const sevenDaysAgo = new Date()
   sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
   sevenDaysAgo.setHours(0,0,0,0)
 
-  const { data: weeklyData } = await supabase
-    .from('distributions')
-    .select('quantity')
-    .gte('created_at', sevenDaysAgo.toISOString())
+  const [
+    { data: staffList },
+    { data: distributions },
+    { data: weeklyData }
+  ] = await Promise.all([
+    supabase.from('users').select('id, full_name').eq('role', 'staff').order('full_name'),
+    supabase.from('distributions').select('id, created_at, quantity, status, staff:users!distributions_staff_id_fkey (full_name)').gte('created_at', today.toISOString()).order('created_at', { ascending: false }).limit(10),
+    supabase.from('distributions').select('quantity').gte('created_at', sevenDaysAgo.toISOString())
+  ])
 
   const weeklyTotal = weeklyData?.reduce((acc, curr) => acc + curr.quantity, 0) || 0
 

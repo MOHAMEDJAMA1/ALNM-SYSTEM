@@ -14,32 +14,23 @@ export async function getStaffDashboardData() {
   const { user } = await verifySession(['staff'])
   const supabase = await createClient()
 
-  // 1. Fetch Customers count
-  const { count: customerCount } = await supabase
-    .from('customers')
-    .select('*', { count: 'exact', head: true })
-    .eq('staff_id', user.id)
+  const today = new Date().toISOString().split('T')[0]
 
-  // 2. Fetch Distributions (Tanks Received)
-  const { data: distributions } = await supabase
-    .from('distributions')
-    .select('id, created_at, quantity')
-    .eq('staff_id', user.id)
-    .eq('status', 'completed')
+  const [
+    { count: customerCount },
+    { data: distributions },
+    { data: sales },
+    { data: payments },
+    { data: customers }
+  ] = await Promise.all([
+    supabase.from('customers').select('*', { count: 'exact', head: true }).eq('staff_id', user.id),
+    supabase.from('distributions').select('id, created_at, quantity').eq('staff_id', user.id).eq('status', 'completed'),
+    supabase.from('sales').select('id, sale_type, total_amount, sale_items (quantity)').eq('staff_id', user.id).eq('status', 'completed'),
+    supabase.from('payments').select('amount, payment_method, sale:sales!inner(staff_id)').gte('created_at', `${today}T00:00:00.000Z`).eq('sale.staff_id', user.id),
+    supabase.from('customers').select('debt').eq('staff_id', user.id)
+  ])
 
   const totalReceived = distributions?.reduce((acc, curr) => acc + curr.quantity, 0) || 0
-
-  // 3. Fetch Sales (Tanks Sold & Money)
-  const { data: sales } = await supabase
-    .from('sales')
-    .select(`
-      id,
-      sale_type,
-      total_amount,
-      sale_items (quantity)
-    `)
-    .eq('staff_id', user.id)
-    .eq('status', 'completed')
 
   const totalSold = sales?.reduce((acc, s) => {
     const itemQty = s.sale_items?.reduce((a: number, i: any) => a + i.quantity, 0) || 0
@@ -54,26 +45,12 @@ export async function getStaffDashboardData() {
     ?.filter(s => s.sale_type === 'credit')
     ?.reduce((acc, s) => acc + Number(s.total_amount), 0) || 0
 
-  // 4. Fetch Payments Today (Cash Sales vs Debt Repayments)
-  const today = new Date().toISOString().split('T')[0]
-  const { data: payments } = await supabase
-    .from('payments')
-    .select(`amount, payment_method, sale:sales!inner(staff_id)`)
-    .gte('created_at', `${today}T00:00:00.000Z`)
-    .eq('sale.staff_id', user.id)
-
   const debtPaymentsToday = payments
     ?.filter(p => p.payment_method === 'debt_repayment')
     ?.reduce((acc, p) => acc + Number(p.amount), 0) || 0
 
   // We calculate Money Collected as actual payments received (auto-cash + manual repayments)
   const moneyCollectedToday = (payments?.reduce((acc, p) => acc + Number(p.amount), 0) || 0)
-
-  // 5. Total Outstanding Debt for this Staff
-  const { data: customers } = await supabase
-    .from('customers')
-    .select('debt')
-    .eq('staff_id', user.id)
 
   const outstandingDebt = customers?.reduce((acc, c) => acc + Number(c.debt || 0), 0) || 0
 
