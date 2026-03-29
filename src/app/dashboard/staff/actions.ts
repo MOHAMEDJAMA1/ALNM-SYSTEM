@@ -1,0 +1,328 @@
+'use server'
+
+import { createClient } from '@/utils/supabase/server'
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+import { verifySession } from '@/utils/auth'
+import { SaleSchema, SubmissionSchema } from '@/utils/validation'
+import { logAction } from '@/utils/audit'
+
+/**
+ * Fetch dashboard data for the logged-in staff member.
+ */
+export async function getStaffDashboardData() {
+  const { user } = await verifySession(['staff'])
+  const supabase = await createClient()
+
+  // 1. Fetch Customers count
+  const { count: customerCount } = await supabase
+    .from('customers')
+    .select('*', { count: 'exact', head: true })
+    .eq('staff_id', user.id)
+
+  // 2. Fetch Distributions (Tanks Received)
+  const { data: distributions } = await supabase
+    .from('distributions')
+    .select('id, created_at, quantity')
+    .eq('staff_id', user.id)
+    .eq('status', 'completed')
+
+  const totalReceived = distributions?.reduce((acc, curr) => acc + curr.quantity, 0) || 0
+
+  // 3. Fetch Sales (Tanks Sold & Money)
+  const { data: sales } = await supabase
+    .from('sales')
+    .select(`
+      id,
+      sale_type,
+      total_amount,
+      sale_items (quantity)
+    `)
+    .eq('staff_id', user.id)
+    .eq('status', 'completed')
+
+  const totalSold = sales?.reduce((acc, s) => {
+    const itemQty = s.sale_items?.reduce((a: number, i: any) => a + i.quantity, 0) || 0
+    return acc + itemQty
+  }, 0) || 0
+
+  const cashSalesToday = sales
+    ?.filter(s => s.sale_type === 'cash')
+    ?.reduce((acc, s) => acc + Number(s.total_amount), 0) || 0
+
+  const creditSalesToday = sales
+    ?.filter(s => s.sale_type === 'credit')
+    ?.reduce((acc, s) => acc + Number(s.total_amount), 0) || 0
+
+  // 4. Fetch Payments Today (Cash Sales vs Debt Repayments)
+  const today = new Date().toISOString().split('T')[0]
+  const { data: payments } = await supabase
+    .from('payments')
+    .select(`amount, payment_method, sale:sales!inner(staff_id)`)
+    .gte('created_at', `${today}T00:00:00.000Z`)
+    .eq('sale.staff_id', user.id)
+
+  const debtPaymentsToday = payments
+    ?.filter(p => p.payment_method === 'debt_repayment')
+    ?.reduce((acc, p) => acc + Number(p.amount), 0) || 0
+
+  // We calculate Money Collected as actual payments received (auto-cash + manual repayments)
+  const moneyCollectedToday = (payments?.reduce((acc, p) => acc + Number(p.amount), 0) || 0)
+
+  // 5. Total Outstanding Debt for this Staff
+  const { data: customers } = await supabase
+    .from('customers')
+    .select('debt')
+    .eq('staff_id', user.id)
+
+  const outstandingDebt = customers?.reduce((acc, c) => acc + Number(c.debt || 0), 0) || 0
+
+  return {
+    metrics: {
+      tanksReceived: totalReceived,
+      tanksSold: totalSold,
+      remainingTanks: totalReceived - totalSold,
+      cashSalesToday,
+      creditSalesToday,
+      debtPaymentsToday,
+      moneyCollectedToday,
+      outstandingDebt,
+      customerCount: customerCount || 0
+    },
+    recentSales: sales?.slice(0, 5) || [],
+    recentDistributions: distributions?.slice(0, 5) || []
+  }
+}
+
+
+/**
+ * Record a new sale with inventory validation and debt logic.
+ */
+export async function recordSale(prevState: any, formData: FormData) {
+  const { user } = await verifySession(['staff'])
+  const supabase = await createClient()
+
+  const rawData = {
+    customer_id: formData.get('customer_id') as string,
+    sale_type: formData.get('sale_type') as string,
+    items: [{
+      item_id: '', // Will be resolved below
+      quantity: parseInt(formData.get('quantity') as string),
+      unit_price: 5.00, // Globally enforced unit price
+    }],
+    total_amount: 0 // Will be calculated
+  }
+
+  // 1. Get default item (Water Tank)
+  const { data: items } = await supabase.from('items').select('id').limit(1)
+  const item_id = items?.[0]?.id
+  if (!item_id) return { message: 'System Error: No items found.', errors: true }
+  rawData.items[0].item_id = item_id
+  rawData.total_amount = rawData.items[0].quantity * rawData.items[0].unit_price
+
+  // 2. Validate with Zod
+  const validated = SaleSchema.safeParse(rawData)
+  if (!validated.success) {
+    return { message: validated.error.issues[0].message, errors: true }
+  }
+
+  const { customer_id, sale_type, items: saleItems, total_amount } = validated.data
+  const { quantity, unit_price } = saleItems[0]
+
+  // 3. Validate Customer Ownership & Status
+  const { data: customer, error: custError } = await supabase
+    .from('customers')
+    .select('id, status, name, staff_id')
+    .eq('id', customer_id)
+    .single()
+
+  if (custError || !customer) return { message: 'Customer not found.', errors: true }
+  
+  // Security Check: Ensure staff owns this customer
+  if (customer.staff_id !== user.id) {
+    await logAction('CANCEL_SALE', { details: { reason: 'Unauthorized customer access attempt', customer_id } })
+    return { message: 'Unauthorized: You do not manage this customer.', errors: true }
+  }
+
+  if (customer.status !== 'active') {
+    return { message: `Customer "${customer.name}" is INACTIVE and cannot receive new sales.`, errors: true }
+  }
+
+  // 4. Validate Inventory (Stock Verification)
+  const { metrics } = await getStaffDashboardData()
+  if (quantity > metrics.remainingTanks) {
+    return { 
+      message: `Insufficient Stock. You only have ${metrics.remainingTanks} units available.`, 
+      errors: true 
+    }
+  }
+
+  // 5. Create Sale
+  const { data: sale, error: saleError } = await supabase
+    .from('sales')
+    .insert({
+      staff_id: user.id,
+      customer_id,
+      sale_type,
+      total_amount,
+      status: 'completed'
+    })
+    .select()
+    .single()
+
+  if (saleError) {
+    console.error('Sale Error:', saleError)
+    return { message: 'Failed to record sale.', errors: true }
+  }
+
+  // 6. Create Sale Item
+  const { error: itemError } = await supabase
+    .from('sale_items')
+    .insert({
+      sale_id: sale.id,
+      item_id,
+      quantity,
+      unit_price
+    })
+
+  if (itemError) {
+    console.error('Sale Item Error:', itemError)
+    return { message: 'Failed to record sale items.', errors: true }
+  }
+
+  // 7. Conditional Logic: Cash Payment vs Credit Debt
+  if (sale_type === 'cash') {
+    await supabase.from('payments').insert({
+      sale_id: sale.id,
+      amount: total_amount,
+      payment_method: 'cash'
+    })
+  } else if (sale_type === 'credit') {
+    // Increase customer debt
+    const { error: debtError } = await supabase.rpc('increment_customer_debt', {
+      cust_id: customer_id,
+      amount: total_amount
+    })
+
+    if (debtError) {
+      const { data: currentCust } = await supabase.from('customers').select('debt').eq('id', customer_id).single()
+      const newDebt = (Number(currentCust?.debt || 0)) + total_amount
+      await supabase.from('customers').update({ debt: newDebt }).eq('id', customer_id)
+    }
+  }
+
+  // 8. Log Success
+  await logAction('CREATE_SALE', { 
+    targetTable: 'sales', 
+    targetId: sale.id, 
+    details: { customer_id, total_amount, sale_type } 
+  })
+
+  revalidatePath('/dashboard/staff')
+  redirect('/dashboard/staff/history?success=true&message=Sale+recorded+successfully')
+}
+
+/**
+ * Submit Daily Report (Cash Submission)
+ */
+export async function submitDailyReport(prevState: any, formData: FormData) {
+  const { user } = await verifySession(['staff'])
+  const supabase = await createClient()
+
+  const amount = parseFloat(formData.get('amount') as string)
+  
+  const validated = SubmissionSchema.safeParse({ amount })
+  if (!validated.success) {
+    return { message: validated.error.issues[0].message, errors: true }
+  }
+
+  const { error } = await supabase
+    .from('cash_submissions')
+    .insert({
+      staff_id: user.id,
+      amount: validated.data.amount,
+      status: 'pending'
+    })
+
+  if (error) {
+    console.error('Report Error:', error)
+    return { message: 'Failed to submit report.', errors: true }
+  }
+
+  await logAction('SUBMIT_CASH', { details: { amount: validated.data.amount } })
+
+  revalidatePath('/dashboard/staff')
+  return { message: 'Report submitted successfully!', errors: false }
+}
+
+/**
+ * Check if a sale is locked (submitted or verified)
+ */
+async function isSaleLocked(supabase: any, saleId: string, staffId: string) {
+  const { data: sale } = await supabase
+    .from('sales')
+    .select('created_at')
+    .eq('id', saleId)
+    .single()
+
+  if (!sale) return true // Lock if not found
+
+  // Check if any submission exists for the same day
+  const date = new Date(sale.created_at).toISOString().split('T')[0]
+  const { count } = await supabase
+    .from('cash_submissions')
+    .select('*', { count: 'exact', head: true })
+    .eq('staff_id', staffId)
+    .gte('created_at', `${date}T00:00:00Z`)
+    .lte('created_at', `${date}T23:59:59Z`)
+
+  return count > 0 // If submission exists, it's locked
+}
+
+export async function updateSale(id: string, quantity: number, unitPrice: number) {
+  const { user } = await verifySession(['staff'])
+  const supabase = await createClient()
+
+  if (await isSaleLocked(supabase, id, user.id)) {
+    throw new Error('Transaction is locked and cannot be edited after submission.')
+  }
+
+  // 1. Update Sale Items
+  const { error: itemError } = await supabase
+    .from('sale_items')
+    .update({ quantity, unit_price: unitPrice })
+    .eq('sale_id', id)
+
+  if (itemError) throw new Error('Failed to update sale items')
+
+  // 2. Update Sale Total
+  const totalAmount = quantity * unitPrice
+  const { error: saleError } = await supabase
+    .from('sales')
+    .update({ total_amount: totalAmount, updated_at: new Date().toISOString() })
+    .eq('id', id)
+
+  if (saleError) throw new Error('Failed to update sale total')
+
+  await logAction('UPDATE_SALE', { targetTable: 'sales', targetId: id, details: { quantity, totalAmount } })
+  revalidatePath('/dashboard/staff')
+}
+
+export async function deleteSale(id: string) {
+  const { user } = await verifySession(['staff'])
+  const supabase = await createClient()
+
+  if (await isSaleLocked(supabase, id, user.id)) {
+    throw new Error('Transaction is locked and cannot be deleted after submission.')
+  }
+
+  const { error } = await supabase
+    .from('sales')
+    .delete()
+    .eq('id', id)
+
+  if (error) throw new Error('Failed to delete sale')
+
+  await logAction('DELETE_SALE', { targetTable: 'sales', targetId: id })
+  revalidatePath('/dashboard/staff')
+}
